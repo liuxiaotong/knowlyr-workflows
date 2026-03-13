@@ -1,0 +1,240 @@
+name: Reusable Python Deploy
+
+on:
+  workflow_call:
+    inputs:
+      app_dir:
+        description: "Server deployment directory (e.g. /var/www/knowlyr-id)"
+        required: true
+        type: string
+      service_name:
+        description: "systemd service name"
+        required: true
+        type: string
+      health_url:
+        description: "Health check URL (e.g. http://127.0.0.1:8100/health)"
+        required: true
+        type: string
+      health_wait:
+        description: "Seconds to wait after restart before health check"
+        required: false
+        type: number
+        default: 8
+      install_command:
+        description: "Dependency install command (run inside venv)"
+        required: false
+        type: string
+        default: "pip install -q -r requirements.txt"
+      run_migrations:
+        description: "Whether to run alembic upgrade head"
+        required: false
+        type: boolean
+        default: false
+      rsync_excludes:
+        description: "Comma-separated rsync exclude list"
+        required: false
+        type: string
+        default: ".git,.github,.env,.venv,__pycache__,.claude"
+      rsync_source:
+        description: "Local source path for rsync"
+        required: false
+        type: string
+        default: "./"
+      extra_services:
+        description: "Comma-separated extra systemd services to restart"
+        required: false
+        type: string
+        default: ""
+      auto_tag:
+        description: "Whether to auto-create a version tag after deploy"
+        required: false
+        type: boolean
+        default: true
+      tag_prefix:
+        description: "Tag prefix (e.g. v or backend-v)"
+        required: false
+        type: string
+        default: "v"
+      pre_deploy_script:
+        description: "Script to run on server before rsync (executed via bash)"
+        required: false
+        type: string
+        default: ""
+      post_deploy_script:
+        description: "Script to run on server after successful deploy"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SSH_KEY:
+        required: true
+      SSH_HOST:
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/key.pem
+          chmod 600 ~/.ssh/key.pem
+          ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Snapshot for rollback
+        run: |
+          ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
+            set -euo pipefail
+            APP_DIR="${{ inputs.app_dir }}"
+            if [ -d "$APP_DIR" ]; then
+              if [ -L "${APP_DIR}.prev" ]; then
+                echo "ERROR: ${APP_DIR}.prev is a symlink, aborting"
+                exit 1
+              fi
+              rm -rf "${APP_DIR}.prev"
+              cp -a "$APP_DIR" "${APP_DIR}.prev"
+              echo "Snapshot saved to ${APP_DIR}.prev"
+            fi
+          REMOTE
+
+      - name: Run pre-deploy script
+        if: inputs.pre_deploy_script != ''
+        run: |
+          ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
+            set -euo pipefail
+            ${{ inputs.pre_deploy_script }}
+          REMOTE
+
+      - name: Deploy code via rsync
+        run: |
+          EXCLUDES=""
+          IFS=',' read -ra ITEMS <<< "${{ inputs.rsync_excludes }}"
+          for item in "${ITEMS[@]}"; do
+            EXCLUDES="$EXCLUDES --exclude='$(echo "$item" | xargs)'"
+          done
+          eval rsync -avz --delete \
+            $EXCLUDES \
+            -e "ssh -i ~/.ssh/key.pem -o StrictHostKeyChecking=yes" \
+            "${{ inputs.rsync_source }}" "root@${{ secrets.SSH_HOST }}:${{ inputs.app_dir }}/"
+
+      - name: Install dependencies
+        run: |
+          ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
+            set -euo pipefail
+            cd "${{ inputs.app_dir }}"
+            if [ ! -d .venv ]; then
+              echo "Creating virtual environment..."
+              python3 -m venv .venv
+            fi
+            source .venv/bin/activate
+            ${{ inputs.install_command }}
+          REMOTE
+
+      - name: Run database migrations
+        if: inputs.run_migrations
+        run: |
+          ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
+            set -euo pipefail
+            cd "${{ inputs.app_dir }}"
+            source .venv/bin/activate
+            set -a; source .env; set +a
+            alembic upgrade head
+          REMOTE
+
+      - name: Restart services
+        run: |
+          ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
+            set -euo pipefail
+            systemctl restart "${{ inputs.service_name }}"
+            echo "Restarted ${{ inputs.service_name }}"
+
+            EXTRA="${{ inputs.extra_services }}"
+            if [ -n "$EXTRA" ]; then
+              IFS=',' read -ra SVCS <<< "$EXTRA"
+              for svc in "${SVCS[@]}"; do
+                svc=$(echo "$svc" | xargs)
+                if systemctl is-enabled "$svc" 2>/dev/null; then
+                  systemctl restart "$svc"
+                  echo "Restarted $svc"
+                else
+                  echo "Skipped $svc (not enabled)"
+                fi
+              done
+            fi
+          REMOTE
+
+      - name: Health check
+        run: |
+          echo "Waiting ${{ inputs.health_wait }} seconds for service to start..."
+          sleep ${{ inputs.health_wait }}
+          STATUS=$(ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} \
+            "curl -sf -o /dev/null -w '%{http_code}' ${{ inputs.health_url }}" || true)
+          if [ "$STATUS" = "200" ]; then
+            echo "Health check passed - HTTP $STATUS"
+          else
+            echo "Health check FAILED - HTTP $STATUS"
+            echo ""
+            echo "=== Recent service logs ==="
+            ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} \
+              "journalctl -u ${{ inputs.service_name }} -n 40 --no-pager" || true
+            echo ""
+            echo "=== Rolling back to previous version ==="
+            ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
+              set -euo pipefail
+              APP_DIR="${{ inputs.app_dir }}"
+              if [ -d "${APP_DIR}.prev" ]; then
+                if [ -L "$APP_DIR" ]; then
+                  echo "ERROR: $APP_DIR is a symlink, aborting rollback"
+                  exit 1
+                fi
+                rm -rf "$APP_DIR"
+                mv "${APP_DIR}.prev" "$APP_DIR"
+                systemctl restart "${{ inputs.service_name }}"
+                echo "Rolled back and restarted ${{ inputs.service_name }}"
+              else
+                echo "No .prev snapshot found, cannot rollback"
+              fi
+          REMOTE
+            exit 1
+          fi
+
+      - name: Run post-deploy script
+        if: inputs.post_deploy_script != ''
+        run: |
+          ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
+            set -euo pipefail
+            ${{ inputs.post_deploy_script }}
+          REMOTE
+
+      - name: Auto version tag
+        if: inputs.auto_tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          TAG_PREFIX="${{ inputs.tag_prefix }}"
+          LATEST=$(git tag -l "${TAG_PREFIX}*" --sort=-version:refname | head -1)
+
+          if [ -z "$LATEST" ]; then
+            NEXT="${TAG_PREFIX}0.1.0"
+          else
+            # Extract version numbers after the prefix
+            VERSION="${LATEST#$TAG_PREFIX}"
+            MAJOR=$(echo "$VERSION" | cut -d. -f1)
+            MINOR=$(echo "$VERSION" | cut -d. -f2)
+            PATCH=$(echo "$VERSION" | cut -d. -f3)
+            NEXT="${TAG_PREFIX}${MAJOR}.${MINOR}.$((PATCH + 1))"
+          fi
+
+          SUBJECT=$(git log -1 --format=%s)
+          git tag -a "$NEXT" -m "$NEXT - $SUBJECT"
+          git push origin "$NEXT"
+          echo "### Tagged $NEXT" >> $GITHUB_STEP_SUMMARY
