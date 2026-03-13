@@ -1,0 +1,202 @@
+name: Reusable Static Site Deploy
+
+on:
+  workflow_call:
+    inputs:
+      webroot:
+        description: "Production directory (e.g. /var/www/knowlyr.com)"
+        required: true
+        type: string
+      build_command:
+        description: "Build command (e.g. python3 scripts/build.py)"
+        required: true
+        type: string
+      build_deps:
+        description: "Build dependency install command"
+        required: false
+        type: string
+        default: ""
+      verify_files:
+        description: "Comma-separated list of files that must exist after build"
+        required: true
+        type: string
+      rsync_excludes:
+        description: "Comma-separated rsync exclude list"
+        required: false
+        type: string
+        default: ".git,.github,scripts,__pycache__,.claude,content,private,tests,CLAUDE.md,README.md,CHANGELOG.md"
+      post_deploy_script:
+        description: "Script to run on server after deploy (e.g. nginx cache config)"
+        required: false
+        type: string
+        default: ""
+      restore_dirs:
+        description: "Comma-separated dirs to restore from .prev after atomic switch (e.g. tools)"
+        required: false
+        type: string
+        default: ""
+      auto_tag:
+        description: "Whether to auto-create a version tag after deploy"
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      SSH_KEY:
+        required: true
+      SSH_HOST:
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        if: inputs.build_deps != ''
+        run: ${{ inputs.build_deps }}
+
+      - name: Build site
+        run: ${{ inputs.build_command }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Verify build artifacts
+        run: |
+          echo "Checking critical files..."
+          MISSING=0
+          IFS=',' read -ra FILES <<< "${{ inputs.verify_files }}"
+          for f in "${FILES[@]}"; do
+            f=$(echo "$f" | xargs)
+            if [ ! -f "$f" ]; then
+              echo "  MISSING: $f"
+              MISSING=1
+            else
+              echo "  OK: $f"
+            fi
+          done
+
+          if [ "$MISSING" = "1" ]; then
+            echo "Build verification FAILED"
+            exit 1
+          fi
+          echo "Build verification passed"
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/key.pem
+          chmod 600 ~/.ssh/key.pem
+          ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy to staging
+        run: |
+          STAGING="${{ inputs.webroot }}.new"
+          ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} \
+            "rm -rf $STAGING && mkdir -p $STAGING"
+
+          EXCLUDES=""
+          IFS=',' read -ra ITEMS <<< "${{ inputs.rsync_excludes }}"
+          for item in "${ITEMS[@]}"; do
+            EXCLUDES="$EXCLUDES --exclude='$(echo "$item" | xargs)'"
+          done
+
+          eval rsync -avz --delete \
+            $EXCLUDES \
+            -e "ssh -i ~/.ssh/key.pem -o StrictHostKeyChecking=yes" \
+            ./ "root@${{ secrets.SSH_HOST }}:$STAGING/"
+
+      - name: Health check (staging)
+        run: |
+          STAGING="${{ inputs.webroot }}.new"
+          SSH_CMD="ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }}"
+          FAILED=0
+
+          IFS=',' read -ra FILES <<< "${{ inputs.verify_files }}"
+          for f in "${FILES[@]}"; do
+            f=$(echo "$f" | xargs)
+            if $SSH_CMD "test -f $STAGING/$f"; then
+              echo "  OK   $f"
+            else
+              echo "  FAIL $f"
+              FAILED=1
+            fi
+          done
+
+          # Check index.html content integrity (>1KB)
+          SIZE=$($SSH_CMD "stat -c%s $STAGING/index.html" 2>/dev/null || echo "0")
+          if [ "$SIZE" -lt 1000 ]; then
+            echo "  FAIL index.html too small (${SIZE}B)"
+            FAILED=1
+          else
+            echo "  OK   index.html size: ${SIZE}B"
+          fi
+
+          if [ "$FAILED" = "1" ]; then
+            echo "Health check FAILED - cleaning up staging"
+            $SSH_CMD "rm -rf $STAGING"
+            exit 1
+          fi
+          echo "Health check passed"
+
+      - name: Atomic switch to live
+        run: |
+          WEBROOT="${{ inputs.webroot }}"
+          STAGING="${WEBROOT}.new"
+          ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} "\
+            rm -rf ${WEBROOT}.prev && \
+            mv ${WEBROOT} ${WEBROOT}.prev && \
+            mv ${STAGING} ${WEBROOT}"
+          echo "Deployed to ${WEBROOT} (previous version saved as .prev)"
+
+      - name: Restore server-managed directories
+        if: inputs.restore_dirs != ''
+        run: |
+          ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
+            set -euo pipefail
+            WEBROOT="${{ inputs.webroot }}"
+            IFS=',' read -ra DIRS <<< "${{ inputs.restore_dirs }}"
+            for d in "${DIRS[@]}"; do
+              d=$(echo "$d" | xargs)
+              if [ -d "${WEBROOT}.prev/$d" ]; then
+                cp -r "${WEBROOT}.prev/$d" "${WEBROOT}/$d"
+                echo "  Restored: $d"
+              fi
+            done
+          REMOTE
+
+      - name: Run post-deploy script
+        if: inputs.post_deploy_script != ''
+        run: |
+          ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
+            set -euo pipefail
+            ${{ inputs.post_deploy_script }}
+          REMOTE
+
+      - name: Auto version tag
+        if: inputs.auto_tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          LATEST=$(git tag -l 'v*' --sort=-version:refname | head -1)
+
+          if [ -z "$LATEST" ]; then
+            NEXT="v0.1.0"
+          else
+            VERSION="${LATEST#v}"
+            MAJOR=$(echo "$VERSION" | cut -d. -f1)
+            MINOR=$(echo "$VERSION" | cut -d. -f2)
+            PATCH=$(echo "$VERSION" | cut -d. -f3)
+            NEXT="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+          fi
+
+          SUBJECT=$(git log -1 --format=%s)
+          git tag -a "$NEXT" -m "$NEXT - $SUBJECT"
+          git push origin "$NEXT"
+          echo "### Tagged $NEXT" >> $GITHUB_STEP_SUMMARY
