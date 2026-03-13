@@ -1,0 +1,104 @@
+name: Reusable PyPI Publish
+
+on:
+  workflow_call:
+    inputs:
+      python_version:
+        description: "Python version to use"
+        type: string
+        default: "3.12"
+      build_tool:
+        description: "Build tool: uv or setuptools"
+        type: string
+        default: "uv"
+      run_tests:
+        description: "Run tests before publishing"
+        type: boolean
+        default: false
+      test_command:
+        description: "Test command to run"
+        type: string
+        default: "pytest"
+      monorepo_packages:
+        description: "Comma-separated sub-package paths for monorepo (e.g. packages/core,packages/sandbox)"
+        type: string
+        default: ""
+
+jobs:
+  test:
+    if: ${{ inputs.run_tests }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install dependencies (uv)
+        if: ${{ inputs.build_tool == 'uv' && inputs.monorepo_packages == '' }}
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          uv pip install --system -e ".[dev]" 2>/dev/null || uv pip install --system -e "."
+
+      - name: Install dependencies (setuptools)
+        if: ${{ inputs.build_tool == 'setuptools' && inputs.monorepo_packages == '' }}
+        run: |
+          pip install -e ".[all]" 2>/dev/null || pip install -e ".[dev]" 2>/dev/null || pip install -e "."
+          pip install pytest
+
+      - name: Install monorepo packages
+        if: ${{ inputs.monorepo_packages != '' }}
+        run: |
+          IFS=',' read -ra PKGS <<< "${{ inputs.monorepo_packages }}"
+          for pkg in "${PKGS[@]}"; do
+            pkg=$(echo "$pkg" | xargs)
+            pip install -e "${pkg}[dev]" 2>/dev/null || pip install -e "$pkg"
+          done
+
+      - name: Run tests
+        run: ${{ inputs.test_command }}
+
+  publish:
+    needs: test
+    if: ${{ always() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Build with uv
+        if: ${{ inputs.build_tool == 'uv' && inputs.monorepo_packages == '' }}
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          uv build
+
+      - name: Build with setuptools
+        if: ${{ inputs.build_tool == 'setuptools' && inputs.monorepo_packages == '' }}
+        run: |
+          pip install build
+          python -m build
+
+      - name: Build monorepo packages
+        if: ${{ inputs.monorepo_packages != '' }}
+        run: |
+          pip install build
+          mkdir -p dist/
+          IFS=',' read -ra PKGS <<< "${{ inputs.monorepo_packages }}"
+          for pkg in "${PKGS[@]}"; do
+            pkg=$(echo "$pkg" | xargs)
+            echo "=== Building $pkg ==="
+            python -m build "$pkg/"
+            cp "$pkg"/dist/* dist/
+          done
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
