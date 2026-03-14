@@ -115,15 +115,14 @@ jobs:
 
       - name: Deploy code via rsync
         run: |
-          EXCLUDES=""
+          ARGS=(rsync -avz --delete)
           IFS=',' read -ra ITEMS <<< "${{ inputs.rsync_excludes }}"
           for item in "${ITEMS[@]}"; do
-            EXCLUDES="$EXCLUDES --exclude='$(echo "$item" | xargs)'"
+            ARGS+=(--exclude="$(echo "$item" | xargs)")
           done
-          eval rsync -avz --delete \
-            $EXCLUDES \
-            -e "ssh -i ~/.ssh/key.pem -o StrictHostKeyChecking=yes" \
-            "${{ inputs.rsync_source }}" "root@${{ secrets.SSH_HOST }}:${{ inputs.app_dir }}/"
+          ARGS+=(-e "ssh -i ~/.ssh/key.pem -o StrictHostKeyChecking=yes")
+          ARGS+=("${{ inputs.rsync_source }}" "root@${{ secrets.SSH_HOST }}:${{ inputs.app_dir }}/")
+          "${ARGS[@]}"
 
       - name: Install dependencies
         run: |
