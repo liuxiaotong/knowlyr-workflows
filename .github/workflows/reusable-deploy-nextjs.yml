@@ -1,0 +1,225 @@
+name: Reusable Next.js Deploy
+
+on:
+  workflow_call:
+    inputs:
+      app_dir:
+        description: "Server deployment directory (e.g. /var/www/antgather.knowlyr.com)"
+        required: true
+        type: string
+      service_name:
+        description: "systemd service name (e.g. antgather)"
+        required: true
+        type: string
+      health_url:
+        description: "Health check URL (e.g. http://127.0.0.1:3100/projects)"
+        required: true
+        type: string
+      health_wait:
+        description: "Seconds to wait after restart before health check"
+        required: false
+        type: number
+        default: 10
+      node_version:
+        description: "Node.js version"
+        required: false
+        type: number
+        default: 22
+      build_env:
+        description: "Build-time environment variables (multi-line KEY=VALUE)"
+        required: false
+        type: string
+        default: ""
+      server_env_content:
+        description: "Server .env file content (multi-line KEY=VALUE, caller resolves secrets)"
+        required: false
+        type: string
+        default: ""
+      extra_services:
+        description: "Comma-separated extra systemd services to restart"
+        required: false
+        type: string
+        default: ""
+      auto_tag:
+        description: "Whether to auto-create a version tag after deploy"
+        required: false
+        type: boolean
+        default: true
+      post_deploy_script:
+        description: "Script to run on server after deploy (e.g. nginx config)"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SSH_KEY:
+        required: true
+      SSH_HOST:
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Write build env
+        if: inputs.build_env != ''
+        run: |
+          cat >> "$GITHUB_ENV" <<'BUILDENV'
+          ${{ inputs.build_env }}
+          BUILDENV
+
+      - name: Build
+        run: npm run build
+
+      - name: Prepare standalone bundle
+        run: |
+          cp -r .next/static .next/standalone/.next/
+          cp -r public .next/standalone/
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/key.pem
+          chmod 600 ~/.ssh/key.pem
+          ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Snapshot for rollback
+        run: |
+          ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
+            set -euo pipefail
+            APP_DIR="${{ inputs.app_dir }}"
+            if [ -d "$APP_DIR" ]; then
+              if [ -L "${APP_DIR}.prev" ]; then
+                echo "ERROR: ${APP_DIR}.prev is a symlink, aborting"
+                exit 1
+              fi
+              rm -rf "${APP_DIR}.prev"
+              cp -a "$APP_DIR" "${APP_DIR}.prev"
+              echo "Snapshot saved to ${APP_DIR}.prev"
+            fi
+          REMOTE
+
+      - name: Stop service & clean node_modules
+        run: |
+          ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} \
+            "systemctl stop ${{ inputs.service_name }} && rm -rf ${{ inputs.app_dir }}/node_modules"
+
+      - name: Deploy via rsync
+        run: |
+          rsync -avz --delete \
+            --exclude 'data/' \
+            --exclude '.env' \
+            -e "ssh -i ~/.ssh/key.pem -o StrictHostKeyChecking=yes" \
+            .next/standalone/ root@${{ secrets.SSH_HOST }}:${{ inputs.app_dir }}/
+
+      - name: Write server env
+        if: inputs.server_env_content != ''
+        run: |
+          cat > /tmp/.env.deploy <<'ENVEOF'
+          ${{ inputs.server_env_content }}
+          ENVEOF
+          sed -i 's/^[[:space:]]*//' /tmp/.env.deploy
+          scp -i ~/.ssh/key.pem /tmp/.env.deploy root@${{ secrets.SSH_HOST }}:${{ inputs.app_dir }}/.env
+          rm -f /tmp/.env.deploy
+
+      - name: Run post-deploy script
+        if: inputs.post_deploy_script != ''
+        run: |
+          ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
+            set -euo pipefail
+            ${{ inputs.post_deploy_script }}
+          REMOTE
+
+      - name: Restart services
+        run: |
+          ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
+            set -euo pipefail
+            systemctl restart "${{ inputs.service_name }}"
+            echo "Restarted ${{ inputs.service_name }}"
+
+            EXTRA="${{ inputs.extra_services }}"
+            if [ -n "$EXTRA" ]; then
+              IFS=',' read -ra SVCS <<< "$EXTRA"
+              for svc in "${SVCS[@]}"; do
+                svc=$(echo "$svc" | xargs)
+                if systemctl is-enabled "$svc" 2>/dev/null; then
+                  systemctl restart "$svc"
+                  echo "Restarted $svc"
+                else
+                  echo "Skipped $svc (not enabled)"
+                fi
+              done
+            fi
+          REMOTE
+
+      - name: Health check
+        run: |
+          echo "Waiting ${{ inputs.health_wait }} seconds for service to start..."
+          sleep ${{ inputs.health_wait }}
+          STATUS=$(ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} \
+            "curl -sf -o /dev/null -w '%{http_code}' ${{ inputs.health_url }}" || true)
+          if [ "$STATUS" = "200" ]; then
+            echo "Health check passed - HTTP $STATUS"
+          else
+            echo "Health check FAILED - HTTP $STATUS"
+            echo ""
+            echo "=== Recent service logs ==="
+            ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} \
+              "journalctl -u ${{ inputs.service_name }} -n 40 --no-pager" || true
+            echo ""
+            echo "=== Rolling back to previous version ==="
+            ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
+              set -euo pipefail
+              APP_DIR="${{ inputs.app_dir }}"
+              if [ -d "${APP_DIR}.prev" ]; then
+                if [ -L "$APP_DIR" ]; then
+                  echo "ERROR: $APP_DIR is a symlink, aborting rollback"
+                  exit 1
+                fi
+                rm -rf "$APP_DIR"
+                mv "${APP_DIR}.prev" "$APP_DIR"
+                systemctl restart "${{ inputs.service_name }}"
+                echo "Rolled back and restarted ${{ inputs.service_name }}"
+              else
+                echo "No .prev snapshot found, cannot rollback"
+              fi
+          REMOTE
+            exit 1
+          fi
+
+      - name: Auto version tag
+        if: inputs.auto_tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          LATEST=$(git tag -l 'v*' --sort=-version:refname | head -1)
+
+          if [ -z "$LATEST" ]; then
+            NEXT="v0.1.0"
+          else
+            VERSION="${LATEST#v}"
+            MAJOR=$(echo "$VERSION" | cut -d. -f1)
+            MINOR=$(echo "$VERSION" | cut -d. -f2)
+            PATCH=$(echo "$VERSION" | cut -d. -f3)
+            NEXT="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+          fi
+
+          SUBJECT=$(git log -1 --format=%s)
+          git tag -a "$NEXT" -m "$NEXT - $SUBJECT"
+          git push origin "$NEXT"
+          echo "### Tagged $NEXT" >> $GITHUB_STEP_SUMMARY
