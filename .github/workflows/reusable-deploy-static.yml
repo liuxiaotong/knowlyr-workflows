@@ -90,31 +90,31 @@ jobs:
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/key.pem
+          printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/key.pem
           chmod 600 ~/.ssh/key.pem
           ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
 
       - name: Deploy to staging
         run: |
           STAGING="${{ inputs.webroot }}.new"
-          ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} \
+          SSH_OPTS="-i ~/.ssh/key.pem -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
+          ssh $SSH_OPTS root@${{ secrets.SSH_HOST }} \
             "rm -rf $STAGING && mkdir -p $STAGING"
 
-          EXCLUDES=""
+          ARGS=(rsync -avz --delete)
           IFS=',' read -ra ITEMS <<< "${{ inputs.rsync_excludes }}"
           for item in "${ITEMS[@]}"; do
-            EXCLUDES="$EXCLUDES --exclude='$(echo "$item" | xargs)'"
+            ARGS+=(--exclude="$(echo "$item" | xargs)")
           done
 
-          eval rsync -avz --delete \
-            $EXCLUDES \
-            -e "ssh -i ~/.ssh/key.pem -o StrictHostKeyChecking=yes" \
-            ./ "root@${{ secrets.SSH_HOST }}:$STAGING/"
+          ARGS+=(-e "ssh $SSH_OPTS")
+          ARGS+=(./ "root@${{ secrets.SSH_HOST }}:$STAGING/")
+          "${ARGS[@]}"
 
       - name: Health check (staging)
         run: |
           STAGING="${{ inputs.webroot }}.new"
-          SSH_CMD="ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }}"
+          SSH_CMD="ssh -i ~/.ssh/key.pem -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes root@${{ secrets.SSH_HOST }}"
           FAILED=0
 
           IFS=',' read -ra FILES <<< "${{ inputs.verify_files }}"
@@ -148,7 +148,7 @@ jobs:
         run: |
           WEBROOT="${{ inputs.webroot }}"
           STAGING="${WEBROOT}.new"
-          ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} "\
+          ssh -i ~/.ssh/key.pem -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes root@${{ secrets.SSH_HOST }} "\
             rm -rf ${WEBROOT}.prev && \
             mv ${WEBROOT} ${WEBROOT}.prev && \
             mv ${STAGING} ${WEBROOT}"
@@ -157,7 +157,7 @@ jobs:
       - name: Restore server-managed directories
         if: inputs.restore_dirs != ''
         run: |
-          ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
+          ssh -i ~/.ssh/key.pem -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
             set -euo pipefail
             WEBROOT="${{ inputs.webroot }}"
             IFS=',' read -ra DIRS <<< "${{ inputs.restore_dirs }}"
@@ -173,7 +173,7 @@ jobs:
       - name: Run post-deploy script
         if: inputs.post_deploy_script != ''
         run: |
-          ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
+          ssh -i ~/.ssh/key.pem -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
             set -euo pipefail
             ${{ inputs.post_deploy_script }}
           REMOTE
