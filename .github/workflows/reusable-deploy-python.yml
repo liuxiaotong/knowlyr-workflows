@@ -11,6 +11,16 @@ on:
         description: "systemd service name"
         required: true
         type: string
+      summary_subject:
+        description: "Human-readable subject shown in deploy receipt"
+        required: false
+        type: string
+        default: ""
+      public_url:
+        description: "Optional public URL shown in deploy receipt"
+        required: false
+        type: string
+        default: ""
       health_url:
         description: "Health check URL (e.g. http://127.0.0.1:8100/health)"
         required: true
@@ -237,3 +247,63 @@ jobs:
           git tag -a "$NEXT" -m "$NEXT - $SUBJECT"
           git push origin "$NEXT"
           echo "### Tagged $NEXT" >> $GITHUB_STEP_SUMMARY
+
+      - name: Write human deploy receipt (success)
+        if: success()
+        run: |
+          SUBJECT="${{ inputs.summary_subject }}"
+          if [ -z "$SUBJECT" ]; then
+            SUBJECT="${GITHUB_REPOSITORY#*/}"
+          fi
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          {
+            echo "## 墨言回执"
+            echo "✅ ${SUBJECT} 部署成功，已经上线"
+            echo
+            echo "你现在只需要知道："
+            echo "- 新版本已经生效"
+            echo "- 服务重启并通过健康检查"
+            if [ -n "${{ inputs.public_url }}" ]; then
+              echo "- 产品地址：${{ inputs.public_url }}"
+            fi
+            echo
+            echo "排查时再看："
+            echo "- 健康检查：${{ inputs.health_url }}"
+            echo "- 服务名：${{ inputs.service_name }}"
+            echo "- 发布记录：${RUN_URL}"
+          } | tee deploy-receipt.txt
+          cat deploy-receipt.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Write human deploy receipt (failure)
+        if: failure()
+        run: |
+          SUBJECT="${{ inputs.summary_subject }}"
+          if [ -z "$SUBJECT" ]; then
+            SUBJECT="${GITHUB_REPOSITORY#*/}"
+          fi
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          {
+            echo "## 墨言回执"
+            echo "❌ ${SUBJECT} 这次没发成，线上可能还不是新版本"
+            echo
+            echo "你现在只需要知道："
+            echo "- GitHub Actions 这次部署失败了"
+            echo "- 建议先看 workflow 日志，不要继续发版"
+            if [ -n "${{ inputs.public_url }}" ]; then
+              echo "- 对外地址暂时还是原来的：${{ inputs.public_url }}"
+            fi
+            echo
+            echo "排查时再看："
+            echo "- 健康检查：${{ inputs.health_url }}"
+            echo "- 服务名：${{ inputs.service_name }}"
+            echo "- 发布记录：${RUN_URL}"
+          } | tee deploy-receipt.txt
+          cat deploy-receipt.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload deploy receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-receipt
+          path: deploy-receipt.txt
+          if-no-files-found: ignore
