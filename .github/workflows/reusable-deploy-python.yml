@@ -92,6 +92,15 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Initialize deploy report workspace
+        run: |
+          mkdir -p artifacts
+          {
+            echo "DEPLOY_PHASE=snapshot"
+            echo "ROLLBACK_ATTEMPTED=false"
+            echo "ROLLBACK_RESULT=not_needed"
+          } >> "$GITHUB_ENV"
+
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
@@ -101,6 +110,7 @@ jobs:
 
       - name: Snapshot for rollback
         run: |
+          echo "DEPLOY_PHASE=snapshot" >> "$GITHUB_ENV"
           ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
             set -euo pipefail
             APP_DIR="${{ inputs.app_dir }}"
@@ -118,6 +128,7 @@ jobs:
       - name: Run pre-deploy script
         if: inputs.pre_deploy_script != ''
         run: |
+          echo "DEPLOY_PHASE=pre_deploy_script" >> "$GITHUB_ENV"
           ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
             set -euo pipefail
             ${{ inputs.pre_deploy_script }}
@@ -125,6 +136,7 @@ jobs:
 
       - name: Deploy code via rsync
         run: |
+          echo "DEPLOY_PHASE=deploy_code" >> "$GITHUB_ENV"
           ARGS=(rsync -avz --delete)
           IFS=',' read -ra ITEMS <<< "${{ inputs.rsync_excludes }}"
           for item in "${ITEMS[@]}"; do
@@ -136,6 +148,7 @@ jobs:
 
       - name: Install dependencies
         run: |
+          echo "DEPLOY_PHASE=install_dependencies" >> "$GITHUB_ENV"
           ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
             set -euo pipefail
             cd "${{ inputs.app_dir }}"
@@ -150,6 +163,7 @@ jobs:
       - name: Run database migrations
         if: inputs.run_migrations
         run: |
+          echo "DEPLOY_PHASE=run_migrations" >> "$GITHUB_ENV"
           ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
             set -euo pipefail
             cd "${{ inputs.app_dir }}"
@@ -160,6 +174,7 @@ jobs:
 
       - name: Restart services
         run: |
+          echo "DEPLOY_PHASE=restart_services" >> "$GITHUB_ENV"
           ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
             set -euo pipefail
             systemctl restart "${{ inputs.service_name }}"
@@ -182,12 +197,37 @@ jobs:
 
       - name: Health check
         run: |
+          echo "DEPLOY_PHASE=health_check" >> "$GITHUB_ENV"
+          mkdir -p artifacts
           echo "Waiting ${{ inputs.health_wait }} seconds for service to start..."
           sleep ${{ inputs.health_wait }}
           STATUS=$(ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} \
             "curl -sf -o /dev/null -w '%{http_code}' ${{ inputs.health_url }}" || true)
           if [ "$STATUS" = "200" ]; then
             echo "Health check passed - HTTP $STATUS"
+            python3 - <<'PY'
+            import json
+            from pathlib import Path
+
+            payload = {
+                "status": "success",
+                "check_type": "http_health_check",
+                "target": "${{ inputs.health_url }}",
+                "expected_status": 200,
+                "observed_status": 200,
+                "wait_seconds": ${{ inputs.health_wait }},
+                "summary": "上线后检查通过（HTTP 200）",
+            }
+            Path("artifacts/release-smoke.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            PY
+            {
+              echo "DEPLOY_PHASE=completed"
+              echo "ROLLBACK_ATTEMPTED=false"
+              echo "ROLLBACK_RESULT=not_needed"
+            } >> "$GITHUB_ENV"
           else
             echo "Health check FAILED - HTTP $STATUS"
             echo ""
@@ -196,7 +236,8 @@ jobs:
               "journalctl -u ${{ inputs.service_name }} -n 40 --no-pager" || true
             echo ""
             echo "=== Rolling back to previous version ==="
-            ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
+            ROLLBACK_STATUS="failed"
+            if ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
               set -euo pipefail
               APP_DIR="${{ inputs.app_dir }}"
               if [ -d "${APP_DIR}.prev" ]; then
@@ -208,16 +249,50 @@ jobs:
                 mv "${APP_DIR}.prev" "$APP_DIR"
                 systemctl restart "${{ inputs.service_name }}"
                 echo "Rolled back and restarted ${{ inputs.service_name }}"
-              else
-                echo "No .prev snapshot found, cannot rollback"
+                exit 0
               fi
+              echo "No .prev snapshot found, cannot rollback"
+              exit 2
           REMOTE
+            then
+              ROLLBACK_STATUS="success"
+            else
+              rc=$?
+              if [ "$rc" = "2" ]; then
+                ROLLBACK_STATUS="not_available"
+              fi
+            fi
+            {
+              echo "ROLLBACK_ATTEMPTED=true"
+              echo "ROLLBACK_RESULT=$ROLLBACK_STATUS"
+            } >> "$GITHUB_ENV"
+            python3 - <<PY
+            import json
+            from pathlib import Path
+
+            payload = {
+                "status": "failure",
+                "check_type": "http_health_check",
+                "target": "${{ inputs.health_url }}",
+                "expected_status": 200,
+                "observed_status": "${STATUS}",
+                "wait_seconds": ${{ inputs.health_wait }},
+                "rollback_attempted": True,
+                "rollback_result": "${ROLLBACK_STATUS}",
+                "summary": f"上线后检查失败（HTTP {'${STATUS}' or '无响应'}）",
+            }
+            Path("artifacts/release-smoke.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            PY
             exit 1
           fi
 
       - name: Run post-deploy script
         if: inputs.post_deploy_script != ''
         run: |
+          echo "DEPLOY_PHASE=post_deploy_script" >> "$GITHUB_ENV"
           ssh -i ~/.ssh/key.pem root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
             set -euo pipefail
             ${{ inputs.post_deploy_script }}
@@ -226,6 +301,7 @@ jobs:
       - name: Auto version tag
         if: inputs.auto_tag
         run: |
+          echo "DEPLOY_PHASE=auto_tag" >> "$GITHUB_ENV"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
@@ -247,63 +323,42 @@ jobs:
           git tag -a "$NEXT" -m "$NEXT - $SUBJECT"
           git push origin "$NEXT"
           echo "### Tagged $NEXT" >> $GITHUB_STEP_SUMMARY
+          echo "DEPLOY_PHASE=completed" >> "$GITHUB_ENV"
 
-      - name: Write human deploy receipt (success)
-        if: success()
-        run: |
-          SUBJECT="${{ inputs.summary_subject }}"
-          if [ -z "$SUBJECT" ]; then
-            SUBJECT="${GITHUB_REPOSITORY#*/}"
-          fi
-          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          {
-            echo "## 墨言回执"
-            echo "✅ ${SUBJECT} 部署成功，已经上线"
-            echo
-            echo "你现在只需要知道："
-            echo "- 新版本已经生效"
-            echo "- 服务重启并通过健康检查"
-            if [ -n "${{ inputs.public_url }}" ]; then
-              echo "- 产品地址：${{ inputs.public_url }}"
-            fi
-            echo
-            echo "排查时再看："
-            echo "- 健康检查：${{ inputs.health_url }}"
-            echo "- 服务名：${{ inputs.service_name }}"
-            echo "- 发布记录：${RUN_URL}"
-          } | tee deploy-receipt.txt
-          cat deploy-receipt.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Mark deploy completed
+        if: success() && !inputs.auto_tag
+        run: echo "DEPLOY_PHASE=completed" >> "$GITHUB_ENV"
 
-      - name: Write human deploy receipt (failure)
-        if: failure()
+      - name: Write deploy report
+        if: always()
+        env:
+          DEPLOY_STATUS: ${{ job.status }}
         run: |
-          SUBJECT="${{ inputs.summary_subject }}"
-          if [ -z "$SUBJECT" ]; then
-            SUBJECT="${GITHUB_REPOSITORY#*/}"
+          STATUS="$DEPLOY_STATUS"
+          if [ "$STATUS" != "success" ]; then
+            STATUS="failure"
           fi
-          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          {
-            echo "## 墨言回执"
-            echo "❌ ${SUBJECT} 这次没发成，线上可能还不是新版本"
-            echo
-            echo "你现在只需要知道："
-            echo "- GitHub Actions 这次部署失败了"
-            echo "- 建议先看 workflow 日志，不要继续发版"
-            if [ -n "${{ inputs.public_url }}" ]; then
-              echo "- 对外地址暂时还是原来的：${{ inputs.public_url }}"
-            fi
-            echo
-            echo "排查时再看："
-            echo "- 健康检查：${{ inputs.health_url }}"
-            echo "- 服务名：${{ inputs.service_name }}"
-            echo "- 发布记录：${RUN_URL}"
-          } | tee deploy-receipt.txt
-          cat deploy-receipt.txt >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/deploy/write_report.py \
+            --output-dir artifacts \
+            --status "$STATUS" \
+            --subject "${{ inputs.summary_subject }}" \
+            --public-url "${{ inputs.public_url }}" \
+            --health-url "${{ inputs.health_url }}" \
+            --service-name "${{ inputs.service_name }}" \
+            --target-path "${{ inputs.app_dir }}" \
+            --phase "${DEPLOY_PHASE:-unknown}" \
+            --rollback-attempted "${ROLLBACK_ATTEMPTED:-false}" \
+            --rollback-result "${ROLLBACK_RESULT:-}" \
+            --smoke-file artifacts/release-smoke.json \
+            --legacy-receipt deploy-receipt.txt
+          cat artifacts/deploy-report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload deploy receipt
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: deploy-receipt
-          path: deploy-receipt.txt
+          path: |
+            artifacts
+            deploy-receipt.txt
           if-no-files-found: ignore
