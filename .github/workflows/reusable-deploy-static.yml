@@ -67,17 +67,31 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Initialize deploy report workspace
+        run: |
+          mkdir -p artifacts
+          {
+            echo "DEPLOY_PHASE=install_build_dependencies"
+            echo "ROLLBACK_ATTEMPTED=false"
+            echo "ROLLBACK_RESULT=not_needed"
+          } >> "$GITHUB_ENV"
+
       - name: Install build dependencies
         if: inputs.build_deps != ''
-        run: ${{ inputs.build_deps }}
+        run: |
+          echo "DEPLOY_PHASE=install_build_dependencies" >> "$GITHUB_ENV"
+          ${{ inputs.build_deps }}
 
       - name: Build site
-        run: ${{ inputs.build_command }}
+        run: |
+          echo "DEPLOY_PHASE=build_site" >> "$GITHUB_ENV"
+          ${{ inputs.build_command }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
       - name: Verify build artifacts
         run: |
+          echo "DEPLOY_PHASE=verify_build" >> "$GITHUB_ENV"
           echo "Checking critical files..."
           MISSING=0
           IFS=',' read -ra FILES <<< "${{ inputs.verify_files }}"
@@ -106,6 +120,7 @@ jobs:
 
       - name: Deploy to staging
         run: |
+          echo "DEPLOY_PHASE=deploy_staging" >> "$GITHUB_ENV"
           STAGING="${{ inputs.webroot }}.new"
           SSH_OPTS="-i ~/.ssh/key.pem -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
           ssh $SSH_OPTS root@${{ secrets.SSH_HOST }} \
@@ -123,17 +138,26 @@ jobs:
 
       - name: Health check (staging)
         run: |
+          echo "DEPLOY_PHASE=staging_health_check" >> "$GITHUB_ENV"
+          mkdir -p artifacts
           STAGING="${{ inputs.webroot }}.new"
           SSH_CMD="ssh -i ~/.ssh/key.pem -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes root@${{ secrets.SSH_HOST }}"
           FAILED=0
+          VERIFIED=0
+          INDEX_TOO_SMALL=false
+          : > artifacts/staging-verified-files.txt
+          : > artifacts/staging-missing-files.txt
 
           IFS=',' read -ra FILES <<< "${{ inputs.verify_files }}"
           for f in "${FILES[@]}"; do
             f=$(echo "$f" | xargs)
             if $SSH_CMD "test -f $STAGING/$f"; then
               echo "  OK   $f"
+              echo "$f" >> artifacts/staging-verified-files.txt
+              VERIFIED=$((VERIFIED + 1))
             else
               echo "  FAIL $f"
+              echo "$f" >> artifacts/staging-missing-files.txt
               FAILED=1
             fi
           done
@@ -143,19 +167,78 @@ jobs:
           if [ "$SIZE" -lt 1000 ]; then
             echo "  FAIL index.html too small (${SIZE}B)"
             FAILED=1
+            INDEX_TOO_SMALL=true
           else
             echo "  OK   index.html size: ${SIZE}B"
           fi
 
+          export INDEX_SIZE="$SIZE"
+          export INDEX_TOO_SMALL
+          export VERIFIED_COUNT="$VERIFIED"
+
           if [ "$FAILED" = "1" ]; then
+            export SMOKE_STATUS="failure"
+            python3 - <<'PY'
+            import json
+            import os
+            from pathlib import Path
+
+            verified = Path("artifacts/staging-verified-files.txt").read_text(encoding="utf-8").splitlines()
+            missing = Path("artifacts/staging-missing-files.txt").read_text(encoding="utf-8").splitlines()
+            size = int(os.environ.get("INDEX_SIZE", "0"))
+            index_too_small = os.environ.get("INDEX_TOO_SMALL", "false").lower() == "true"
+            summary_parts = []
+            if missing:
+                summary_parts.append(f"缺少关键文件 {len(missing)} 个")
+            if index_too_small:
+                summary_parts.append(f"index.html 过小（{size}B）")
+            summary = "预发布检查失败（" + "，".join(summary_parts or ["请看日志"]) + "）"
+            payload = {
+                "status": "failure",
+                "check_type": "static_site_verification",
+                "target": "${{ inputs.webroot }}.new",
+                "verified_files": verified,
+                "missing_files": missing,
+                "index_html_size": size,
+                "summary": summary,
+            }
+            Path("artifacts/release-smoke.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            PY
             echo "Health check FAILED - cleaning up staging"
             $SSH_CMD "rm -rf $STAGING"
             exit 1
           fi
+          export SMOKE_STATUS="success"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          verified = Path("artifacts/staging-verified-files.txt").read_text(encoding="utf-8").splitlines()
+          size = int(os.environ.get("INDEX_SIZE", "0"))
+          summary = f"构建校验和预发布检查通过（关键文件 {len(verified)} 个，index.html {size}B）"
+          payload = {
+              "status": "success",
+              "check_type": "static_site_verification",
+              "target": "${{ inputs.webroot }}.new",
+              "verified_files": verified,
+              "missing_files": [],
+              "index_html_size": size,
+              "summary": summary,
+          }
+          Path("artifacts/release-smoke.json").write_text(
+              json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
           echo "Health check passed"
 
       - name: Atomic switch to live
         run: |
+          echo "DEPLOY_PHASE=atomic_switch" >> "$GITHUB_ENV"
           WEBROOT="${{ inputs.webroot }}"
           STAGING="${WEBROOT}.new"
           ssh -i ~/.ssh/key.pem -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes root@${{ secrets.SSH_HOST }} "\
@@ -163,10 +246,12 @@ jobs:
             mv ${WEBROOT} ${WEBROOT}.prev && \
             mv ${STAGING} ${WEBROOT}"
           echo "Deployed to ${WEBROOT} (previous version saved as .prev)"
+          echo "ROLLBACK_RESULT=available_if_needed" >> "$GITHUB_ENV"
 
       - name: Restore server-managed directories
         if: inputs.restore_dirs != ''
         run: |
+          echo "DEPLOY_PHASE=restore_server_dirs" >> "$GITHUB_ENV"
           ssh -i ~/.ssh/key.pem -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
             set -euo pipefail
             WEBROOT="${{ inputs.webroot }}"
@@ -183,6 +268,7 @@ jobs:
       - name: Run post-deploy script
         if: inputs.post_deploy_script != ''
         run: |
+          echo "DEPLOY_PHASE=post_deploy_script" >> "$GITHUB_ENV"
           ssh -i ~/.ssh/key.pem -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes root@${{ secrets.SSH_HOST }} bash -s <<'REMOTE'
             set -euo pipefail
             ${{ inputs.post_deploy_script }}
@@ -191,6 +277,7 @@ jobs:
       - name: Auto version tag
         if: inputs.auto_tag
         run: |
+          echo "DEPLOY_PHASE=auto_tag" >> "$GITHUB_ENV"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
@@ -210,61 +297,40 @@ jobs:
           git tag -a "$NEXT" -m "$NEXT - $SUBJECT"
           git push origin "$NEXT"
           echo "### Tagged $NEXT" >> $GITHUB_STEP_SUMMARY
+          echo "DEPLOY_PHASE=completed" >> "$GITHUB_ENV"
 
-      - name: Write human deploy receipt (success)
-        if: success()
-        run: |
-          SUBJECT="${{ inputs.summary_subject }}"
-          if [ -z "$SUBJECT" ]; then
-            SUBJECT="${GITHUB_REPOSITORY#*/}"
-          fi
-          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          {
-            echo "## 墨言回执"
-            echo "✅ ${SUBJECT} 部署成功，已经上线"
-            echo
-            echo "你现在只需要知道："
-            echo "- 新版本静态文件已经切到线上"
-            echo "- 构建产物校验和 staging 检查都通过了"
-            if [ -n "${{ inputs.public_url }}" ]; then
-              echo "- 产品地址：${{ inputs.public_url }}"
-            fi
-            echo
-            echo "排查时再看："
-            echo "- 线上目录：${{ inputs.webroot }}"
-            echo "- 发布记录：${RUN_URL}"
-          } | tee deploy-receipt.txt
-          cat deploy-receipt.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Mark deploy completed
+        if: success() && !inputs.auto_tag
+        run: echo "DEPLOY_PHASE=completed" >> "$GITHUB_ENV"
 
-      - name: Write human deploy receipt (failure)
-        if: failure()
+      - name: Write deploy report
+        if: always()
+        env:
+          DEPLOY_STATUS: ${{ job.status }}
         run: |
-          SUBJECT="${{ inputs.summary_subject }}"
-          if [ -z "$SUBJECT" ]; then
-            SUBJECT="${GITHUB_REPOSITORY#*/}"
+          STATUS="$DEPLOY_STATUS"
+          if [ "$STATUS" != "success" ]; then
+            STATUS="failure"
           fi
-          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          {
-            echo "## 墨言回执"
-            echo "❌ ${SUBJECT} 这次没发成，线上可能还是旧版本"
-            echo
-            echo "你现在只需要知道："
-            echo "- GitHub Actions 这次静态发布失败了"
-            echo "- 建议先看 workflow 日志，不要继续发版"
-            if [ -n "${{ inputs.public_url }}" ]; then
-              echo "- 对外地址暂时还是原来的：${{ inputs.public_url }}"
-            fi
-            echo
-            echo "排查时再看："
-            echo "- 线上目录：${{ inputs.webroot }}"
-            echo "- 发布记录：${RUN_URL}"
-          } | tee deploy-receipt.txt
-          cat deploy-receipt.txt >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/deploy/write_report.py \
+            --output-dir artifacts \
+            --status "$STATUS" \
+            --subject "${{ inputs.summary_subject }}" \
+            --public-url "${{ inputs.public_url }}" \
+            --target-path "${{ inputs.webroot }}" \
+            --phase "${DEPLOY_PHASE:-unknown}" \
+            --rollback-attempted "${ROLLBACK_ATTEMPTED:-false}" \
+            --rollback-result "${ROLLBACK_RESULT:-}" \
+            --smoke-file artifacts/release-smoke.json \
+            --legacy-receipt deploy-receipt.txt
+          cat artifacts/deploy-report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload deploy receipt
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: deploy-receipt
-          path: deploy-receipt.txt
+          path: |
+            artifacts
+            deploy-receipt.txt
           if-no-files-found: ignore
