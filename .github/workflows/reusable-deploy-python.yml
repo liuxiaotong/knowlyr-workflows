@@ -205,24 +205,7 @@ jobs:
             "curl -sf -o /dev/null -w '%{http_code}' ${{ inputs.health_url }}" || true)
           if [ "$STATUS" = "200" ]; then
             echo "Health check passed - HTTP $STATUS"
-            python3 - <<'PY'
-            import json
-            from pathlib import Path
-
-            payload = {
-                "status": "success",
-                "check_type": "http_health_check",
-                "target": "${{ inputs.health_url }}",
-                "expected_status": 200,
-                "observed_status": 200,
-                "wait_seconds": ${{ inputs.health_wait }},
-                "summary": "上线后检查通过（HTTP 200）",
-            }
-            Path("artifacts/release-smoke.json").write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            PY
+            python3 -c 'import json; from pathlib import Path; Path("artifacts/release-smoke.json").write_text(json.dumps({"status":"success","check_type":"http_health_check","target":"${{ inputs.health_url }}","expected_status":200,"observed_status":200,"wait_seconds":${{ inputs.health_wait }},"summary":"上线后检查通过（HTTP 200）"}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")'
             {
               echo "DEPLOY_PHASE=completed"
               echo "ROLLBACK_ATTEMPTED=false"
@@ -266,26 +249,8 @@ jobs:
               echo "ROLLBACK_ATTEMPTED=true"
               echo "ROLLBACK_RESULT=$ROLLBACK_STATUS"
             } >> "$GITHUB_ENV"
-            python3 - <<PY
-            import json
-            from pathlib import Path
-
-            payload = {
-                "status": "failure",
-                "check_type": "http_health_check",
-                "target": "${{ inputs.health_url }}",
-                "expected_status": 200,
-                "observed_status": "${STATUS}",
-                "wait_seconds": ${{ inputs.health_wait }},
-                "rollback_attempted": True,
-                "rollback_result": "${ROLLBACK_STATUS}",
-                "summary": f"上线后检查失败（HTTP {'${STATUS}' or '无响应'}）",
-            }
-            Path("artifacts/release-smoke.json").write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            PY
+            OBSERVED_STATUS="${STATUS:-无响应}"
+            OBSERVED_STATUS_JSON="$OBSERVED_STATUS" ROLLBACK_STATUS_JSON="$ROLLBACK_STATUS" python3 -c 'import json, os; from pathlib import Path; observed=os.environ["OBSERVED_STATUS_JSON"]; rollback=os.environ["ROLLBACK_STATUS_JSON"]; Path("artifacts/release-smoke.json").write_text(json.dumps({"status":"failure","check_type":"http_health_check","target":"${{ inputs.health_url }}","expected_status":200,"observed_status":observed,"wait_seconds":${{ inputs.health_wait }},"rollback_attempted":True,"rollback_result":rollback,"summary":f"上线后检查失败（HTTP {observed}）"}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")'
             exit 1
           fi
 
@@ -338,7 +303,12 @@ jobs:
           if [ "$STATUS" != "success" ]; then
             STATUS="failure"
           fi
-          python3 scripts/deploy/write_report.py \
+          REPORT_WRITER="scripts/deploy/write_report.py"
+          if [ ! -f "$REPORT_WRITER" ]; then
+            REPORT_WRITER="$RUNNER_TEMP/write_report.py"
+            curl -fsSL https://raw.githubusercontent.com/liuxiaotong/knowlyr-workflows/main/scripts/deploy/write_report.py -o "$REPORT_WRITER"
+          fi
+          python3 "$REPORT_WRITER" \
             --output-dir artifacts \
             --status "$STATUS" \
             --subject "${{ inputs.summary_subject }}" \
