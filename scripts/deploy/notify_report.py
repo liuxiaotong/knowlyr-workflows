@@ -146,12 +146,56 @@ def status_payload(channel: str, status: str, **extra: Any) -> dict[str, Any]:
 
 
 def report_text(report: dict[str, Any], preferred_key: str) -> str:
+    preferred = str(report.get(preferred_key) or "").strip()
+    if preferred:
+        return preferred
+    if preferred_key == "feishu_text":
+        return default_feishu_text(report)
     return str(
-        report.get(preferred_key)
-        or report.get("receipt_text")
+        report.get("receipt_text")
         or report.get("summary_markdown")
         or ""
     ).strip()
+
+
+def default_feishu_text(report: dict[str, Any]) -> str:
+    status = str(report.get("status") or "").strip().lower()
+    subject = str(report.get("subject") or report.get("repo_name") or "部署").strip()
+    commit_short = str(report.get("commit_short") or str(report.get("sha") or "")[:7] or "unknown").strip()
+    ref_name = str(report.get("ref_name") or "main").strip()
+    run_url = str(report.get("run_url") or "").strip()
+    public_url = str(report.get("public_url") or "").strip()
+    smoke_summary = str(report.get("smoke_summary") or "").strip()
+    phase = str(report.get("phase") or "unknown").strip()
+    rollback_summary = str(report.get("rollback_summary") or report.get("rollback_result") or "").strip()
+
+    if status == "success":
+        lines = [
+            f"✅ {subject} 部署完成",
+            f"commit: {commit_short}",
+            f"ref: {ref_name}",
+        ]
+        if run_url:
+            lines.append(f"run: {run_url}")
+        if public_url:
+            lines.append(f"public: {public_url}")
+        if smoke_summary:
+            lines.append(f"smoke: {smoke_summary}")
+        return "\n".join(lines)
+
+    lines = [
+        f"❌ {subject} 部署失败",
+        f"phase: {phase}",
+        f"commit: {commit_short}",
+        f"ref: {ref_name}",
+    ]
+    if run_url:
+        lines.append(f"run: {run_url}")
+    if public_url:
+        lines.append(f"public: {public_url}")
+    if rollback_summary:
+        lines.append(f"rollback: {rollback_summary}")
+    return "\n".join(lines)
 
 
 def send_feishu(report: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:

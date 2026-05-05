@@ -6,12 +6,18 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import importlib.util
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 WRITE_REPORT = ROOT / "scripts" / "deploy" / "write_report.py"
 NOTIFY_REPORT = ROOT / "scripts" / "deploy" / "notify_report.py"
+
+spec = importlib.util.spec_from_file_location("notify_report", NOTIFY_REPORT)
+notify_report = importlib.util.module_from_spec(spec)
+assert spec and spec.loader
+spec.loader.exec_module(notify_report)
 
 
 class DeployReportScriptTests(unittest.TestCase):
@@ -137,6 +143,26 @@ class DeployReportScriptTests(unittest.TestCase):
             self.assertEqual(combined["channels"]["antgather"]["status"], "accepted")
             self.assertTrue((tmp_path / "out" / "feishu-notification.json").exists())
             self.assertTrue((tmp_path / "out" / "antgather-notification.json").exists())
+
+    def test_notify_report_builds_silt_style_feishu_fallback(self) -> None:
+        text = notify_report.report_text(
+            {
+                "status": "success",
+                "subject": "Sentinel",
+                "sha": "1234567890",
+                "ref_name": "main",
+                "run_url": "https://github.com/liuxiaotong/knowlyr-sentinel/actions/runs/1",
+                "public_url": "https://sentinel.knowlyr.com",
+                "smoke_summary": "上线后检查通过（HTTP 200）",
+                "receipt_text": "墨言回执\n这是一段较长回执",
+            },
+            "feishu_text",
+        )
+        self.assertIn("✅ Sentinel 部署完成", text)
+        self.assertIn("commit: 1234567", text)
+        self.assertIn("ref: main", text)
+        self.assertIn("smoke: 上线后检查通过（HTTP 200）", text)
+        self.assertNotIn("墨言回执", text)
 
 
 if __name__ == "__main__":
