@@ -150,6 +150,44 @@ def build_plain_text(markdown: str) -> str:
     return text
 
 
+def build_feishu_text(
+    *,
+    status: str,
+    subject: str,
+    public_url: str,
+    run_url: str,
+    commit_short: str,
+    ref_name: str,
+    smoke_summary_text: str,
+    phase: str,
+    rollback_text: str,
+) -> str:
+    if status == "success":
+        lines = [
+            f"✅ {subject} 部署完成",
+            f"commit: {commit_short or 'unknown'}",
+            f"ref: {ref_name or 'main'}",
+            f"run: {run_url}",
+        ]
+        if public_url:
+            lines.append(f"public: {public_url}")
+        if smoke_summary_text:
+            lines.append(f"smoke: {smoke_summary_text}")
+        return "\n".join(lines)
+
+    lines = [
+        f"❌ {subject} 部署失败",
+        f"phase: {phase or 'unknown'}",
+        f"commit: {commit_short or 'unknown'}",
+        f"ref: {ref_name or 'main'}",
+        f"run: {run_url}",
+        f"rollback: {rollback_text}",
+    ]
+    if public_url:
+        lines.append(f"public: {public_url}")
+    return "\n".join(lines)
+
+
 def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
@@ -164,6 +202,7 @@ def main() -> None:
     run_id = os.getenv("GITHUB_RUN_ID", "")
     run_url = f"{server_url}/{github_repository}/actions/runs/{run_id}" if github_repository and run_id else ""
     commit_url = f"{server_url}/{github_repository}/commit/{github_sha}" if github_repository and github_sha else ""
+    ref_name = os.getenv("GITHUB_REF_NAME", "")
     subject = args.subject or repo_name(github_repository or "deploy")
 
     rollback_attempted = to_bool(args.rollback_attempted)
@@ -184,6 +223,17 @@ def main() -> None:
         rollback_text=rollback_text,
     )
     plain_text = build_plain_text(markdown)
+    feishu_text = build_feishu_text(
+        status=args.status,
+        subject=subject,
+        public_url=args.public_url.strip(),
+        run_url=run_url,
+        commit_short=commit_short or "unknown",
+        ref_name=ref_name,
+        smoke_summary_text=smoke_summary_text,
+        phase=args.phase.strip(),
+        rollback_text=rollback_text,
+    )
 
     payload = {
         "status": args.status,
@@ -195,8 +245,11 @@ def main() -> None:
         "commit_url": commit_url,
         "run_url": run_url,
         "event_name": os.getenv("GITHUB_EVENT_NAME", ""),
-        "ref_name": os.getenv("GITHUB_REF_NAME", ""),
+        "ref_name": ref_name,
         "public_url": args.public_url.strip() or None,
+        "health_url": args.health_url.strip() or None,
+        "service_name": args.service_name.strip() or None,
+        "target_path": args.target_path.strip() or None,
         "phase": args.phase.strip(),
         "phase_label": phase_label(args.phase.strip()),
         "rollback_attempted": rollback_attempted,
@@ -206,6 +259,8 @@ def main() -> None:
         "release_smoke": smoke or None,
         "summary_markdown": markdown,
         "receipt_text": plain_text,
+        "feishu_text": feishu_text,
+        "antgather_dm_text": plain_text,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 

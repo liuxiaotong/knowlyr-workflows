@@ -39,8 +39,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Compile deploy report script
-        run: python3 -m py_compile scripts/deploy/write_report.py
+      - name: Compile deploy scripts
+        run: python3 -m py_compile scripts/deploy/write_report.py scripts/deploy/notify_report.py
+
+      - name: Run deploy script tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
 
   node24-action-guard:
     name: node24-action-guard
