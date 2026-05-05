@@ -60,6 +60,46 @@ on:
         required: false
         type: string
         default: ""
+      notify_feishu:
+        description: "Send deploy receipt to Feishu via the shared remote notifier"
+        required: false
+        type: boolean
+        default: false
+      notify_antgather:
+        description: "Send deploy receipt to AntGather DM via the shared remote notifier"
+        required: false
+        type: boolean
+        default: false
+      notify_feishu_config_path:
+        description: "Remote feishu.yaml path used by the notifier"
+        required: false
+        type: string
+        default: "/opt/knowlyr-silt/project/.silt/feishu.yaml"
+      notify_feishu_bot_id:
+        description: "Feishu bot_id to load from notify_feishu_config_path"
+        required: false
+        type: string
+        default: "moyan"
+      notify_antgather_env_path:
+        description: "Remote AntGather backend .env path used to load ANTGATHER_INTERNAL_TOKEN"
+        required: false
+        type: string
+        default: "/var/www/antgather-api/.env"
+      notify_antgather_url:
+        description: "Remote URL for AntGather internal API"
+        required: false
+        type: string
+        default: "http://127.0.0.1:8200"
+      notify_antgather_sender_id:
+        description: "AntGather AI sender user_id for deploy notifications"
+        required: false
+        type: string
+        default: "AI3073"
+      notify_antgather_recipient_id:
+        description: "AntGather recipient user_id for deploy notifications"
+        required: false
+        type: string
+        default: "1"
     secrets:
       SSH_KEY:
         required: true
@@ -311,6 +351,59 @@ jobs:
             --smoke-file artifacts/release-smoke.json \
             --legacy-receipt deploy-receipt.txt
           cat artifacts/deploy-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Send deploy notifications
+        if: always() && (inputs.notify_feishu || inputs.notify_antgather)
+        env:
+          DEPLOY_NOTIFY_FEISHU: ${{ inputs.notify_feishu }}
+          DEPLOY_NOTIFY_ANTGATHER: ${{ inputs.notify_antgather }}
+          FEISHU_CONFIG_PATH: ${{ inputs.notify_feishu_config_path }}
+          FEISHU_BOT_ID: ${{ inputs.notify_feishu_bot_id }}
+          ANTGATHER_ENV_PATH: ${{ inputs.notify_antgather_env_path }}
+          ANTGATHER_NOTIFY_URL: ${{ inputs.notify_antgather_url }}
+          ANTGATHER_NOTIFY_SENDER_ID: ${{ inputs.notify_antgather_sender_id }}
+          ANTGATHER_NOTIFY_RECIPIENT_ID: ${{ inputs.notify_antgather_recipient_id }}
+          SSH_HOST_VALUE: ${{ secrets.SSH_HOST }}
+        run: |
+          set +e
+          if [ ! -f artifacts/deploy-report.json ]; then
+            echo "deploy-report.json missing; skip deploy notifications"
+            exit 0
+          fi
+
+          NOTIFY_SCRIPT="scripts/deploy/notify_report.py"
+          if [ ! -f "$NOTIFY_SCRIPT" ]; then
+            NOTIFY_SCRIPT="$RUNNER_TEMP/notify_report.py"
+            curl -fsSL https://raw.githubusercontent.com/liuxiaotong/knowlyr-workflows/main/scripts/deploy/notify_report.py -o "$NOTIFY_SCRIPT" || {
+              echo "failed to fetch notify_report.py; skip deploy notifications"
+              exit 0
+            }
+          fi
+
+          SSH_OPTS=(-i ~/.ssh/key.pem -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
+          SSH_TARGET="root@${SSH_HOST_VALUE}"
+          REMOTE_DIR="/tmp/knowlyr-deploy-notify-${GITHUB_RUN_ID:-manual}"
+          ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "rm -rf '$REMOTE_DIR' && mkdir -p '$REMOTE_DIR/out'" || exit 0
+          scp "${SSH_OPTS[@]}" "$NOTIFY_SCRIPT" "$SSH_TARGET:$REMOTE_DIR/notify_report.py" >/dev/null 2>&1 || exit 0
+          scp "${SSH_OPTS[@]}" artifacts/deploy-report.json "$SSH_TARGET:$REMOTE_DIR/deploy-report.json" >/dev/null 2>&1 || exit 0
+
+          printf -v q_feishu '%q' "$DEPLOY_NOTIFY_FEISHU"
+          printf -v q_antgather '%q' "$DEPLOY_NOTIFY_ANTGATHER"
+          printf -v q_feishu_config '%q' "$FEISHU_CONFIG_PATH"
+          printf -v q_feishu_bot '%q' "$FEISHU_BOT_ID"
+          printf -v q_antgather_env '%q' "$ANTGATHER_ENV_PATH"
+          printf -v q_antgather_url '%q' "$ANTGATHER_NOTIFY_URL"
+          printf -v q_antgather_sender '%q' "$ANTGATHER_NOTIFY_SENDER_ID"
+          printf -v q_antgather_recipient '%q' "$ANTGATHER_NOTIFY_RECIPIENT_ID"
+
+          remote_env="DEPLOY_NOTIFY_FEISHU=$q_feishu DEPLOY_NOTIFY_ANTGATHER=$q_antgather"
+          remote_env="$remote_env FEISHU_CONFIG_PATH=$q_feishu_config FEISHU_BOT_ID=$q_feishu_bot"
+          remote_env="$remote_env ANTGATHER_ENV_PATH=$q_antgather_env ANTGATHER_NOTIFY_URL=$q_antgather_url"
+          remote_env="$remote_env ANTGATHER_NOTIFY_SENDER_ID=$q_antgather_sender ANTGATHER_NOTIFY_RECIPIENT_ID=$q_antgather_recipient"
+          ssh "${SSH_OPTS[@]}" "$SSH_TARGET"             "$remote_env python3 '$REMOTE_DIR/notify_report.py' --report-json '$REMOTE_DIR/deploy-report.json' --output-dir '$REMOTE_DIR/out'" || true
+          scp "${SSH_OPTS[@]}" "$SSH_TARGET:$REMOTE_DIR/out/*.json" artifacts/ >/dev/null 2>&1 || true
+          ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "rm -rf '$REMOTE_DIR'" >/dev/null 2>&1 || true
+          exit 0
 
       - name: Upload deploy receipt
         if: always()
