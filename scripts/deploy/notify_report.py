@@ -166,15 +166,17 @@ def default_feishu_text(report: dict[str, Any]) -> str:
     run_url = str(report.get("run_url") or "").strip()
     public_url = str(report.get("public_url") or "").strip()
     smoke_summary = str(report.get("smoke_summary") or "").strip()
+    release_note = str(report.get("release_note") or "").strip()
     phase = str(report.get("phase") or "unknown").strip()
     rollback_summary = str(report.get("rollback_summary") or report.get("rollback_result") or "").strip()
 
     if status == "success":
         lines = [
             f"✅ {subject} 部署完成",
-            f"commit: {commit_short}",
-            f"ref: {ref_name}",
         ]
+        if release_note:
+            lines.append(f"升级说明：{release_note}")
+        lines.extend([f"commit: {commit_short}", f"ref: {ref_name}"])
         if run_url:
             lines.append(f"run: {run_url}")
         if public_url:
@@ -185,10 +187,10 @@ def default_feishu_text(report: dict[str, Any]) -> str:
 
     lines = [
         f"❌ {subject} 部署失败",
-        f"phase: {phase}",
-        f"commit: {commit_short}",
-        f"ref: {ref_name}",
     ]
+    if release_note:
+        lines.append(f"计划升级：{release_note}")
+    lines.extend([f"phase: {phase}", f"commit: {commit_short}", f"ref: {ref_name}"])
     if run_url:
         lines.append(f"run: {run_url}")
     if public_url:

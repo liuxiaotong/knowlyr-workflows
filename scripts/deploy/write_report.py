@@ -4,6 +4,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import subprocess
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -32,6 +36,9 @@ PHASE_LABELS = {
     "cleanup": "清理备份",
     "completed": "完成",
 }
+
+MAX_RELEASE_NOTE_CHARS = 120
+MAX_RELEASE_DIFF_CHARS = 12000
 
 
 def parse_args() -> argparse.Namespace:
@@ -100,6 +107,210 @@ def repo_name(full_name: str) -> str:
     return full_name
 
 
+def git_output(args: list[str]) -> str:
+    try:
+        return subprocess.check_output(["git", *args], text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return ""
+
+
+def clean_subject(raw: str) -> str:
+    text = re.sub(r"\s+", " ", raw).strip()
+    text = re.sub(
+        r"^(feat|fix|docs|refactor|perf|test|chore|ci|build|style|revert)(\([^)]+\))?!?:\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if re.match(r"^Merge pull request #\d+ from .+$", text, flags=re.IGNORECASE):
+        return ""
+    if re.match(r"^Merge branch .+$", text, flags=re.IGNORECASE):
+        return ""
+    return text.strip("。.;； ")
+
+
+def clean_release_note(raw: str) -> str:
+    text = re.sub(r"\s+", " ", raw).strip()
+    text = re.sub(
+        r"^(release[-_ ]?note|upgrade[-_ ]?note|升级说明|变更说明|版本变化)\s*[:：]\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = text.strip(" -•*。.;；'\"")
+    if len(text) > MAX_RELEASE_NOTE_CHARS:
+        text = text[: MAX_RELEASE_NOTE_CHARS - 3].rstrip(" ，,。.;；") + "..."
+    return text
+
+
+def weak_release_note(text: str) -> bool:
+    lower = text.lower().strip(" 。.;；")
+    weak = {
+        "本次提交已上线",
+        "本次更新已上线",
+        "更新了一些内容",
+        "修复若干问题",
+        "优化若干体验",
+        "update",
+        "updates",
+        "misc",
+    }
+    return not text or lower in weak or len(text) < 8
+
+
+def release_range() -> str:
+    before = os.getenv("GITHUB_EVENT_BEFORE", "").strip()
+    sha = os.getenv("GITHUB_SHA", "").strip()
+
+    event_path = os.getenv("GITHUB_EVENT_PATH", "").strip()
+    if not before and event_path and Path(event_path).exists():
+        try:
+            event = json.loads(Path(event_path).read_text(encoding="utf-8"))
+            before = str(event.get("before") or "").strip()
+        except Exception:
+            before = ""
+
+    if before and not re.fullmatch(r"0+", before) and sha:
+        return f"{before}..{sha}"
+    if sha:
+        parent = git_output(["rev-parse", f"{sha}^"]).strip()
+        if parent:
+            return f"{parent}..{sha}"
+    return "HEAD~1..HEAD"
+
+
+def release_notes_from_bodies(range_expr: str) -> list[str]:
+    bodies = git_output(["log", "--format=%B%x1e", range_expr]).split("\x1e")
+    notes: list[str] = []
+    seen: set[str] = set()
+    for body in bodies:
+        for line in body.splitlines():
+            match = re.match(
+                r"^(?:release[-_ ]?note|upgrade[-_ ]?note|升级说明|变更说明)\s*[:：]\s*(.+)$",
+                line.strip(),
+                flags=re.IGNORECASE,
+            )
+            if not match:
+                continue
+            item = clean_release_note(match.group(1))
+            if not item:
+                continue
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            notes.append(item)
+    return notes
+
+
+def fallback_note_from_subjects(range_expr: str) -> str:
+    subjects = git_output(["log", "--format=%s", range_expr]).splitlines()
+    if not subjects:
+        subjects = git_output(["log", "--format=%s", "-n", "5", os.getenv("GITHUB_SHA") or "HEAD"]).splitlines()
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for subject in subjects:
+        item = clean_subject(subject)
+        lower = item.lower()
+        if not item or lower.startswith("merge ") or lower in {"update", "updates", "misc", "wip"}:
+            continue
+        if lower in seen:
+            continue
+        seen.add(lower)
+        cleaned.append(item)
+    return clean_release_note("；".join(cleaned[:3])) if cleaned else "本次提交已上线"
+
+
+def release_context(range_expr: str) -> str:
+    commits = git_output(["log", "--format=%h %s", range_expr]).strip()
+    names = git_output(["diff", "--name-status", range_expr]).strip()
+    stat = git_output(["diff", "--stat", range_expr]).strip()
+    diff = git_output(["diff", "--unified=1", "--no-ext-diff", range_expr]).strip()
+    if len(diff) > MAX_RELEASE_DIFF_CHARS:
+        diff = diff[:MAX_RELEASE_DIFF_CHARS] + "\n...[diff truncated]"
+    return "\n\n".join(
+        [
+            "Commits:\n" + (commits or "(none)"),
+            "Changed files:\n" + (names or "(none)"),
+            "Diff stat:\n" + (stat or "(none)"),
+            "Diff:\n" + (diff or "(none)"),
+        ]
+    )
+
+
+def llm_release_note(context: str, subject: str) -> str:
+    api_key = (
+        os.getenv("RELEASE_NOTE_LLM_API_KEY", "").strip()
+        or os.getenv("SENTINEL_CODEX_API_KEY", "").strip()
+        or os.getenv("SENTINEL_SILT_OPENAI_KEY", "").strip()
+        or os.getenv("OPENAI_API_KEY", "").strip()
+        or os.getenv("LLM_PROXY_API_KEY", "").strip()
+    )
+    if not api_key:
+        return ""
+    base_url = os.getenv("RELEASE_NOTE_LLM_BASE_URL", "https://sentinel.knowlyr.com/v1").strip().rstrip("/")
+    model = os.getenv("RELEASE_NOTE_LLM_MODEL", "gpt-5.5").strip() or "gpt-5.5"
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你是发布经理。根据代码 diff 判断本次版本变化，写一句中文升级说明。"
+                    "要求：只输出一句；40-90 字；不要自称；不要写“AI”；不要写空泛词；"
+                    "不要说部署成功、健康检查、commit；必须说清这个版本具体实现或改变了什么。"
+                ),
+            },
+            {"role": "user", "content": f"项目：{subject or '当前项目'}\n请生成通知里的“升级说明”。\n\n{context}"},
+        ],
+        "max_tokens": 120,
+    }
+    request = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json; charset=utf-8", "Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, Exception) as exc:  # noqa: BLE001
+        print(f"LLM release note skipped: {exc}")
+        return ""
+    choices = result.get("choices") or []
+    if not choices:
+        return ""
+    message = choices[0].get("message") or {}
+    return clean_release_note(str(message.get("content") or choices[0].get("text") or ""))
+
+
+def build_release_note(subject: str) -> tuple[str, str]:
+    manual = (
+        os.getenv("DEPLOY_RELEASE_NOTE", "").strip()
+        or os.getenv("RELEASE_NOTE", "").strip()
+        or os.getenv("MANUAL_RELEASE_NOTE", "").strip()
+    )
+    if manual:
+        return clean_release_note(manual), "manual"
+
+    range_expr = release_range()
+    note = llm_release_note(release_context(range_expr), subject)
+    if not weak_release_note(note):
+        return note, "llm"
+
+    explicit_notes = release_notes_from_bodies(range_expr)
+    if explicit_notes:
+        note = clean_release_note("；".join(explicit_notes[:3]))
+        if not weak_release_note(note):
+            return note, "commit_body"
+
+    note = fallback_note_from_subjects(range_expr)
+    if not weak_release_note(note):
+        return note, "commit_subject"
+
+    return "本次提交已上线", "fallback"
+
+
 def build_markdown(
     *,
     status: str,
@@ -113,6 +324,7 @@ def build_markdown(
     phase: str,
     smoke_summary_text: str,
     rollback_text: str,
+    release_note: str,
 ) -> str:
     title = "✅ {} 部署成功，已经上线" if status == "success" else "❌ {} 这次没发成，线上可能还是旧版本"
     lines = [
@@ -122,12 +334,16 @@ def build_markdown(
         "你现在只需要知道：",
     ]
     if status == "success":
+        if release_note:
+            lines.append(f"- 升级说明：{release_note}")
         lines.append(f"- {smoke_summary_text}")
         lines.append(f"- 回滚路径：{rollback_text}")
         if public_url:
             lines.append(f"- 产品地址：{public_url}")
         lines.append(f"- 版本：{commit_short}")
     else:
+        if release_note:
+            lines.append(f"- 计划升级：{release_note}")
         lines.append(f"- 卡在：{phase_label(phase)}")
         lines.append(f"- 上线后检查：{smoke_summary_text}")
         lines.append(f"- 自动回滚：{rollback_text}")
@@ -161,14 +377,21 @@ def build_feishu_text(
     smoke_summary_text: str,
     phase: str,
     rollback_text: str,
+    release_note: str,
 ) -> str:
     if status == "success":
         lines = [
             f"✅ {subject} 部署完成",
-            f"commit: {commit_short or 'unknown'}",
-            f"ref: {ref_name or 'main'}",
-            f"run: {run_url}",
         ]
+        if release_note:
+            lines.append(f"升级说明：{release_note}")
+        lines.extend(
+            [
+                f"commit: {commit_short or 'unknown'}",
+                f"ref: {ref_name or 'main'}",
+                f"run: {run_url}",
+            ]
+        )
         if public_url:
             lines.append(f"public: {public_url}")
         if smoke_summary_text:
@@ -177,12 +400,18 @@ def build_feishu_text(
 
     lines = [
         f"❌ {subject} 部署失败",
-        f"phase: {phase or 'unknown'}",
-        f"commit: {commit_short or 'unknown'}",
-        f"ref: {ref_name or 'main'}",
-        f"run: {run_url}",
-        f"rollback: {rollback_text}",
     ]
+    if release_note:
+        lines.append(f"计划升级：{release_note}")
+    lines.extend(
+        [
+            f"phase: {phase or 'unknown'}",
+            f"commit: {commit_short or 'unknown'}",
+            f"ref: {ref_name or 'main'}",
+            f"run: {run_url}",
+            f"rollback: {rollback_text}",
+        ]
+    )
     if public_url:
         lines.append(f"public: {public_url}")
     return "\n".join(lines)
@@ -209,6 +438,7 @@ def main() -> None:
     rollback_result = args.rollback_result.strip()
     smoke_summary_text = smoke_summary(smoke, args.status, args.phase)
     rollback_text = rollback_summary(rollback_attempted, rollback_result)
+    release_note, release_note_source = build_release_note(subject)
     markdown = build_markdown(
         status=args.status,
         subject=subject,
@@ -221,6 +451,7 @@ def main() -> None:
         phase=args.phase.strip(),
         smoke_summary_text=smoke_summary_text,
         rollback_text=rollback_text,
+        release_note=release_note,
     )
     plain_text = build_plain_text(markdown)
     feishu_text = build_feishu_text(
@@ -233,6 +464,7 @@ def main() -> None:
         smoke_summary_text=smoke_summary_text,
         phase=args.phase.strip(),
         rollback_text=rollback_text,
+        release_note=release_note,
     )
 
     payload = {
@@ -255,6 +487,8 @@ def main() -> None:
         "rollback_attempted": rollback_attempted,
         "rollback_result": rollback_result or None,
         "rollback_summary": rollback_text,
+        "release_note": release_note,
+        "release_note_source": release_note_source,
         "smoke_summary": smoke_summary_text,
         "release_smoke": smoke or None,
         "summary_markdown": markdown,
@@ -269,6 +503,8 @@ def main() -> None:
         encoding="utf-8",
     )
     (output_dir / "deploy-report.md").write_text(markdown, encoding="utf-8")
+    (output_dir / "release-note.txt").write_text(release_note + "\n", encoding="utf-8")
+    (output_dir / "release-note-source.txt").write_text(release_note_source + "\n", encoding="utf-8")
 
     if args.legacy_receipt:
         Path(args.legacy_receipt).write_text(plain_text, encoding="utf-8")
