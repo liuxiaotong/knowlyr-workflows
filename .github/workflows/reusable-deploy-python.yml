@@ -120,6 +120,8 @@ on:
         required: true
       SSH_HOST:
         required: true
+      RELEASE_NOTE_LLM_API_KEY:
+        required: false
 
 permissions:
   contents: write
@@ -338,6 +340,9 @@ jobs:
         if: always()
         env:
           DEPLOY_STATUS: ${{ job.status }}
+          RELEASE_NOTE_LLM_API_KEY: ${{ secrets.RELEASE_NOTE_LLM_API_KEY }}
+          RELEASE_NOTE_LLM_BASE_URL: ${{ vars.RELEASE_NOTE_LLM_BASE_URL || 'https://sentinel.knowlyr.com/v1' }}
+          RELEASE_NOTE_LLM_MODEL: ${{ vars.RELEASE_NOTE_LLM_MODEL || 'gpt-5.5' }}
         run: |
           STATUS="$DEPLOY_STATUS"
           if [ "$STATUS" != "success" ]; then
@@ -346,7 +351,7 @@ jobs:
           REPORT_WRITER="scripts/deploy/write_report.py"
           if [ ! -f "$REPORT_WRITER" ]; then
             REPORT_WRITER="$RUNNER_TEMP/write_report.py"
-            curl -fsSL https://raw.githubusercontent.com/liuxiaotong/knowlyr-workflows/main/scripts/deploy/write_report.py -o "$REPORT_WRITER"
+            curl -fsSL https://raw.githubusercontent.com/liuxiaotong/knowlyr-workflows/shared-deploy-notifications-20260509/scripts/deploy/write_report.py -o "$REPORT_WRITER"
           fi
           python3 "$REPORT_WRITER" \
             --output-dir artifacts \
@@ -385,7 +390,7 @@ jobs:
           NOTIFY_SCRIPT="scripts/deploy/notify_report.py"
           if [ ! -f "$NOTIFY_SCRIPT" ]; then
             NOTIFY_SCRIPT="$RUNNER_TEMP/notify_report.py"
-            curl -fsSL https://raw.githubusercontent.com/liuxiaotong/knowlyr-workflows/main/scripts/deploy/notify_report.py -o "$NOTIFY_SCRIPT" || {
+            curl -fsSL https://raw.githubusercontent.com/liuxiaotong/knowlyr-workflows/shared-deploy-notifications-20260509/scripts/deploy/notify_report.py -o "$NOTIFY_SCRIPT" || {
               echo "failed to fetch notify_report.py; skip deploy notifications"
               exit 0
             }
