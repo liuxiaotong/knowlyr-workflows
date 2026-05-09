@@ -43,6 +43,7 @@ class DeployReportScriptTests(unittest.TestCase):
                 "GITHUB_RUN_ID": "12345",
                 "GITHUB_REF_NAME": "main",
                 "GITHUB_EVENT_NAME": "push",
+                "DEPLOY_RELEASE_NOTE": "本次发布新增项目列表筛选入口",
             }
             subprocess.run(
                 [
@@ -79,10 +80,18 @@ class DeployReportScriptTests(unittest.TestCase):
 
             report = json.loads((tmp_path / "artifacts" / "deploy-report.json").read_text(encoding="utf-8"))
             self.assertIn("✅ AntGather 前端 部署完成", report["feishu_text"])
+            self.assertIn("升级说明：本次发布新增项目列表筛选入口", report["feishu_text"])
+            self.assertIn("升级说明：本次发布新增项目列表筛选入口", report["antgather_dm_text"])
+            self.assertEqual(report["release_note"], "本次发布新增项目列表筛选入口")
+            self.assertEqual(report["release_note_source"], "manual")
             self.assertIn("commit: abcdef0", report["feishu_text"])
             self.assertIn("run: https://github.com/liuxiaotong/antgather/actions/runs/12345", report["feishu_text"])
             self.assertIn("墨言回执", report["antgather_dm_text"])
             self.assertEqual(report["health_url"], "http://127.0.0.1:3100/projects")
+            self.assertEqual(
+                (tmp_path / "artifacts" / "release-note.txt").read_text(encoding="utf-8").strip(),
+                "本次发布新增项目列表筛选入口",
+            )
 
     def test_notify_report_dry_run_writes_delivery_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -154,11 +163,13 @@ class DeployReportScriptTests(unittest.TestCase):
                 "run_url": "https://github.com/liuxiaotong/knowlyr-sentinel/actions/runs/1",
                 "public_url": "https://sentinel.knowlyr.com",
                 "smoke_summary": "上线后检查通过（HTTP 200）",
+                "release_note": "发布通知会自动概括本次上线内容",
                 "receipt_text": "墨言回执\n这是一段较长回执",
             },
             "feishu_text",
         )
         self.assertIn("✅ Sentinel 部署完成", text)
+        self.assertIn("升级说明：发布通知会自动概括本次上线内容", text)
         self.assertIn("commit: 1234567", text)
         self.assertIn("ref: main", text)
         self.assertIn("smoke: 上线后检查通过（HTTP 200）", text)
