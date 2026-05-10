@@ -101,8 +101,19 @@ class DeployReportScriptTests(unittest.TestCase):
                 json.dumps(
                     {
                         "repo": "liuxiaotong/antgather",
+                        "status": "success",
+                        "subject": "AntGather 前端",
                         "sha": "abcdef0",
+                        "commit_short": "abcdef0",
+                        "ref_name": "main",
                         "run_url": "https://github.com/liuxiaotong/antgather/actions/runs/12345",
+                        "commit_url": "https://github.com/liuxiaotong/antgather/commit/abcdef0",
+                        "public_url": "https://antgather.knowlyr.com/projects",
+                        "health_url": "http://127.0.0.1:3100/projects",
+                        "service_name": "antgather",
+                        "target_path": "/var/www/antgather.knowlyr.com",
+                        "smoke_summary": "上线后检查通过（HTTP 200）",
+                        "release_note": "本次发布新增项目列表筛选入口",
                         "feishu_text": "✅ AntGather 前端 部署完成",
                         "antgather_dm_text": "墨言回执\n✅ 部署成功，已经上线",
                     },
@@ -150,8 +161,44 @@ class DeployReportScriptTests(unittest.TestCase):
             combined = json.loads((tmp_path / "out" / "deploy-notifications.json").read_text(encoding="utf-8"))
             self.assertEqual(combined["channels"]["feishu"]["status"], "accepted")
             self.assertEqual(combined["channels"]["antgather"]["status"], "accepted")
+            self.assertEqual(combined["channels"]["feishu"]["msg_type"], "interactive")
+            self.assertEqual(combined["channels"]["feishu"]["card_title"], "✅ AntGather 前端 部署完成")
+            self.assertEqual(combined["channels"]["antgather"]["sub_type"], "assistant_receipt")
+            self.assertEqual(combined["channels"]["antgather"]["card_type"], "receipt")
+            self.assertTrue(combined["channels"]["antgather"]["native_card"])
             self.assertTrue((tmp_path / "out" / "feishu-notification.json").exists())
             self.assertTrue((tmp_path / "out" / "antgather-notification.json").exists())
+
+    def test_notify_report_builds_native_cards(self) -> None:
+        report = {
+            "status": "success",
+            "subject": "AntGather 后端 API",
+            "sha": "3240c9165e4190e0252a247c9ad1ff7bdb26e5a2",
+            "commit_short": "3240c91",
+            "commit_url": "https://github.com/liuxiaotong/antgather/commit/3240c916",
+            "run_url": "https://github.com/liuxiaotong/antgather/actions/runs/25629016854",
+            "ref_name": "main",
+            "public_url": "https://antgather.knowlyr.com/api/health",
+            "health_url": "http://127.0.0.1:8200/health",
+            "service_name": "antgather-api.service",
+            "target_path": "/var/www/antgather-api",
+            "release_note": "修复生产多机位冒烟脚本的后端发布目录定位逻辑",
+            "smoke_summary": "AntGather 后端蓝绿切换后健康检查与三视角核心 smoke 均通过",
+        }
+
+        feishu_card = notify_report.build_feishu_card(report)
+        self.assertEqual(feishu_card["header"]["template"], "green")
+        self.assertEqual(feishu_card["header"]["title"]["content"], "✅ AntGather 后端 API 部署完成")
+        self.assertIn("lark_md", json.dumps(feishu_card, ensure_ascii=False))
+        self.assertIn("查看发布记录", json.dumps(feishu_card, ensure_ascii=False))
+
+        antgather_card = notify_report.build_antgather_receipt_card(report)
+        self.assertEqual(antgather_card["actor"], "墨言")
+        self.assertEqual(antgather_card["tone"], "success")
+        self.assertEqual(antgather_card["title"], "AntGather 后端 API 部署成功，已经上线")
+        self.assertEqual(antgather_card["primary_url"], report["run_url"])
+        self.assertEqual(antgather_card["version"], "3240c91")
+        self.assertTrue(any(section["title"] == "你现在只需要知道" for section in antgather_card["sections"]))
 
     def test_notify_report_builds_silt_style_feishu_fallback(self) -> None:
         text = notify_report.report_text(

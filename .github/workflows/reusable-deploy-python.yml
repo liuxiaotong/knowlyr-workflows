@@ -351,7 +351,7 @@ jobs:
           REPORT_WRITER="scripts/deploy/write_report.py"
           if [ ! -f "$REPORT_WRITER" ]; then
             REPORT_WRITER="$RUNNER_TEMP/write_report.py"
-            curl -fsSL https://raw.githubusercontent.com/liuxiaotong/knowlyr-workflows/shared-deploy-notifications-20260509/scripts/deploy/write_report.py -o "$REPORT_WRITER"
+            curl -fsSL https://raw.githubusercontent.com/liuxiaotong/knowlyr-workflows/shared-deploy-native-cards-20260510/scripts/deploy/write_report.py -o "$REPORT_WRITER"
           fi
           python3 "$REPORT_WRITER" \
             --output-dir artifacts \
@@ -390,7 +390,7 @@ jobs:
           NOTIFY_SCRIPT="scripts/deploy/notify_report.py"
           if [ ! -f "$NOTIFY_SCRIPT" ]; then
             NOTIFY_SCRIPT="$RUNNER_TEMP/notify_report.py"
-            curl -fsSL https://raw.githubusercontent.com/liuxiaotong/knowlyr-workflows/shared-deploy-notifications-20260509/scripts/deploy/notify_report.py -o "$NOTIFY_SCRIPT" || {
+            curl -fsSL https://raw.githubusercontent.com/liuxiaotong/knowlyr-workflows/shared-deploy-native-cards-20260510/scripts/deploy/notify_report.py -o "$NOTIFY_SCRIPT" || {
               echo "failed to fetch notify_report.py; skip deploy notifications"
               exit 0
             }
